@@ -314,16 +314,44 @@ async def cmd_admin(message: Message):
 
 @router.message(Command("botset"))
 async def cmd_botset(message: Message, state: FSMContext):
-    """Настройка чатов бота — только для владельца"""
+    """Настройка чатов бота — только для владельца.
+    В личке показывает меню.
+    В групповом чате/теме — показывает кнопки для сохранения текущего чата.
+    """
     if message.from_user.id != OWNER_ID:
-        await message.answer("❌ Только владелец может настраивать бота")
+        return  # молча игнорируем
+
+    if message.chat.type == "private":
+        # Личка — обычное меню
+        await message.answer(
+            "🔧 <b>Настройка бота</b>\n\nВыберите что настроить:",
+            reply_markup=get_botset_keyboard()
+        )
         return
 
+    # Групповой чат — показываем кнопки с текущим чатом/темой
+    chat_title = message.chat.title or str(message.chat.id)
+    topic_id   = message.message_thread_id
+    topic_info = f" → тема <code>{topic_id}</code>" if topic_id else ""
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📬 Этот чат — для ЗАЯВОК",
+            callback_data="botset_admin_chat"
+        )],
+        [InlineKeyboardButton(
+            text="📢 Этот чат — для ГИЛЬДИИ",
+            callback_data="botset_guild_chat"
+        )],
+    ])
     await message.answer(
-        "🔧 <b>Настройка бота</b>\n\n"
-        "Выберите что настроить:",
-        reply_markup=get_botset_keyboard()
+        f"🔧 <b>Настройка чата</b>\n\n"
+        f"📍 <b>{chat_title}</b>{topic_info}\n"
+        f"ID: <code>{message.chat.id}</code>\n\n"
+        "Выбери назначение этого чата:",
+        reply_markup=keyboard
     )
+
 
 @router.callback_query(F.data == "botset_menu")
 async def botset_menu(callback: CallbackQuery):
@@ -363,140 +391,105 @@ async def botset_info(callback: CallbackQuery):
 
 @router.callback_query(F.data.in_({"botset_admin_chat", "botset_guild_chat"}))
 async def botset_start_setup(callback: CallbackQuery, state: FSMContext):
+    """Если вызвано из группы — сохраняет этот чат+тему сразу. Из лички — просит ID."""
     if callback.from_user.id != OWNER_ID:
         await callback.answer("❌ Только владелец", show_alert=True)
         return
 
-    chat_type = "admin" if callback.data == "botset_admin_chat" else "guild"
+    chat_type  = "admin" if callback.data == "botset_admin_chat" else "guild"
     chat_label = "заявок" if chat_type == "admin" else "гильдии"
+    chat_id    = callback.message.chat.id
+    topic_id   = callback.message.message_thread_id  # None если нет темы
+    chat_title = callback.message.chat.title or str(chat_id)
 
-    await state.update_data(botset_type=chat_type)
-    await state.set_state(BotSetState.waiting_chat)
+    # Вызвано из личного чата — просим ввести ID вручную
+    if callback.message.chat.type == "private":
+        await state.update_data(botset_type=chat_type)
+        await state.set_state(BotSetState.waiting_chat)
+        await callback.message.edit_text(
+            f"📨 <b>Настройка чата {chat_label}</b>\n\n"
+            "Вы в личке — введите ID нужного чата:\n"
+            "<code>-1001234567890</code>\n\n"
+            "💡 Или вызовите /botset прямо в нужном чате — бот сохранит его автоматически.\n\n"
+            "/cancel — отмена"
+        )
+        await callback.answer()
+        return
 
-    await callback.message.edit_text(
-        f"📨 <b>Настройка чата {chat_label}</b>\n\n"
-        "Перешлите любое сообщение из нужного чата — "
-        "бот автоматически определит его ID.\n\n"
-        "Или введите ID чата вручную (например: <code>-1001234567890</code>)\n\n"
-        "Отправьте /cancel для отмены"
-    )
-    await callback.answer()
+    # Вызвано из группового чата — сохраняем сразу
+    await _save_chat_settings(chat_type, chat_id, topic_id, chat_title)
+
+    topic_info = f" (тема {topic_id})" if topic_id else ""
+    await callback.answer(f"✅ Чат {chat_label} сохранён!", show_alert=True)
+
+    try:
+        test_kw = {"text": f"✅ Этот чат назначен как чат <b>{chat_label}</b>!"}
+        if topic_id:
+            test_kw["message_thread_id"] = topic_id
+        await bot.send_message(chat_id=chat_id, **test_kw)
+    except Exception as e:
+        await callback.message.answer(f"⚠️ Тест-сообщение не отправлено: {e}")
+
 
 @router.message(BotSetState.waiting_chat)
 async def botset_receive_chat(message: Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
         return
 
-    if message.text and message.text == "/cancel":
+    if message.text and message.text.strip() in ["/cancel", f"/cancel@{(await bot.get_me()).username}"]:
         await state.clear()
-        await message.answer("❌ Настройка отменена", reply_markup=get_botset_keyboard())
+        await message.answer("❌ Отменено")
         return
 
     chat_id = None
+    chat_title = ""
 
-    # Если переслано из чата
     if message.forward_from_chat:
-        chat_id = message.forward_from_chat.id
-        chat_title = message.forward_from_chat.title
-    # Если введён ID вручную
+        chat_id    = message.forward_from_chat.id
+        chat_title = message.forward_from_chat.title or str(chat_id)
     elif message.text:
+        text = message.text.strip().split("/")[0].strip()
         try:
-            chat_id = int(message.text.strip())
+            chat_id    = int(text)
             chat_title = f"ID {chat_id}"
         except ValueError:
-            await message.answer("❌ Неверный формат. Введите числовой ID чата или перешлите сообщение из нужного чата")
+            await message.answer("❌ Введите числовой ID чата, например: <code>-1001234567890</code>")
             return
 
     if not chat_id:
-        await message.answer("❌ Не удалось определить ID чата. Перешлите сообщение из нужного чата")
+        await message.answer("❌ Не удалось определить ID")
         return
 
-    await state.update_data(botset_chat_id=chat_id, botset_chat_title=chat_title)
+    data      = await state.get_data()
+    chat_type = data["botset_type"]
+    label     = "заявок" if chat_type == "admin" else "гильдии"
 
-    # Проверяем — есть ли в чате темы (forum supergroup)
-    try:
-        chat_info = await bot.get_chat(chat_id)
-        is_forum  = getattr(chat_info, 'is_forum', False)
-    except Exception:
-        is_forum = False
-
-    if is_forum:
-        # Предлагаем выбрать тему
-        await state.set_state(BotSetState.waiting_topic)
-        await message.answer(
-            f"✅ Чат найден: <b>{chat_title}</b>\n\n"
-            "Этот чат является форумом с темами.\n"
-            "Введите <b>ID темы</b> (message_thread_id) куда отправлять сообщения, "
-            "или напишите <b>0</b> — чтобы писать в общий чат без темы.\n\n"
-            "💡 Как узнать ID темы: перешлите сообщение из нужной темы боту "
-            "@getidsbot или откройте тему и скопируйте номер из ссылки."
-        )
-    else:
-        # Тем нет, сохраняем сразу
-        await _save_botset_chat(message, state, topic_id=None)
-
-@router.message(BotSetState.waiting_topic)
-async def botset_receive_topic(message: Message, state: FSMContext):
-    if message.from_user.id != OWNER_ID:
-        return
-
-    if message.text == "/cancel":
-        await state.clear()
-        await message.answer("❌ Настройка отменена", reply_markup=get_botset_keyboard())
-        return
-
-    try:
-        topic_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("❌ Введите числовой ID темы или 0 для общего чата")
-        return
-
-    topic_id = topic_id if topic_id != 0 else None
-    await _save_botset_chat(message, state, topic_id=topic_id)
-
-async def _save_botset_chat(message: Message, state: FSMContext, topic_id: Optional[int]):
-    """Сохранить настройки чата"""
-    data       = await state.get_data()
-    chat_id    = data["botset_chat_id"]
-    chat_title = data.get("botset_chat_title", str(chat_id))
-    chat_type  = data["botset_type"]
-
-    if chat_type == "admin":
-        await save_settings({
-            "admin_chat_id":   chat_id,
-            "admin_topic_id":  topic_id,
-            "admin_chat_title": chat_title,
-        })
-        label = "заявок"
-    else:
-        await save_settings({
-            "guild_chat_id":   chat_id,
-            "guild_topic_id":  topic_id,
-            "guild_chat_title": chat_title,
-        })
-        label = "гильдии"
-
+    await _save_chat_settings(chat_type, chat_id, None, chat_title)
     await state.clear()
 
-    topic_info = f"Тема ID: <code>{topic_id}</code>" if topic_id else "Без темы (общий чат)"
-    await message.answer(
-        f"✅ <b>Чат {label} настроен!</b>\n\n"
-        f"Чат: <b>{chat_title}</b>\n"
-        f"ID: <code>{chat_id}</code>\n"
-        f"{topic_info}\n\n"
-        "Теперь все уведомления будут приходить туда.",
-        reply_markup=get_botset_keyboard()
-    )
-
-    # Тест-сообщение
+    await message.answer(f"✅ <b>Чат {label} сохранён!</b>\nID: <code>{chat_id}</code>")
     try:
-        test_kwargs = {"text": f"✅ Тест: бот успешно подключён к чату {label}!"}
-        if topic_id:
-            test_kwargs["message_thread_id"] = topic_id
-        await bot.send_message(chat_id=chat_id, **test_kwargs)
+        await bot.send_message(chat_id=chat_id, text=f"✅ Этот чат назначен как чат {label}!")
     except Exception as e:
-        await message.answer(f"⚠️ Не удалось отправить тест-сообщение: {e}\n"
-                             "Убедитесь что бот добавлен в чат и имеет права на отправку сообщений")
+        await message.answer(f"⚠️ Тест не прошёл: {e}\nПроверь что бот добавлен в чат.")
+
+
+async def _save_chat_settings(chat_type: str, chat_id: int,
+                               topic_id: Optional[int], chat_title: str):
+    """Сохранить настройки чата в БД"""
+    if chat_type == "admin":
+        await save_settings({
+            "admin_chat_id":    chat_id,
+            "admin_topic_id":   topic_id,
+            "admin_chat_title": chat_title,
+        })
+    else:
+        await save_settings({
+            "guild_chat_id":    chat_id,
+            "guild_topic_id":   topic_id,
+            "guild_chat_title": chat_title,
+        })
+
 
 # ==================== /setguild ====================
 
