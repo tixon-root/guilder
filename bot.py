@@ -1,18 +1,18 @@
 import os
 import asyncio
 import logging
-import threading
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from flask import Flask, request as flask_request, Response
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
+from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 MONGO_URI   = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 PORT        = int(os.getenv("PORT", 8080))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")          # https://yourapp.onrender.com  (без / в конце)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")   # https://yourapp.onrender.com  (без / в конце)
 OWNER_ID    = int(os.getenv("ADMIN_ID", "6395348885"))
 GUILD_URL   = "https://www.rucoyonline.com/guild/Imperia%20Of%20Titans"
 
@@ -48,16 +48,10 @@ db           = mongo_client.rucoy_guild
 settings_col = db.settings
 members_col  = db.members
 
-flask_app = Flask(__name__)
-
-# Один event loop на всё приложение (Flask кидает в него задачи)
-main_loop: asyncio.AbstractEventLoop = None
-
-
 # ══════════════════════════════════════════════════════════════
 #  ПАРСИНГ
 #
-#  Реальная структура таблицы (проверено на сайте):
+#  Реальная структура таблицы на сайте:
 #    cols[0] = Name + роль/статус внутри текста
 #              "Hero Of Titan\nSupporter"
 #              "Shop Nomber One\n(Leader)"
@@ -87,7 +81,7 @@ def parse_guild_members() -> list[dict]:
             if len(cols) < 2:
                 continue
 
-            # --- Name + роль ---
+            # Name + роль/статус
             raw   = cols[0].get_text(separator="\n", strip=True)
             lines = [l.strip() for l in raw.splitlines() if l.strip()]
             name      = lines[0] if lines else ""
@@ -99,11 +93,11 @@ def parse_guild_members() -> list[dict]:
             is_leader = "leader" in role_text
             is_online = "online" in role_text
 
-            # --- Level ---
+            # Level
             level_str = cols[1].get_text(strip=True)
             level     = int(level_str) if level_str.isdigit() else 0
 
-            # --- Join date ---
+            # Join date
             join_date = cols[2].get_text(strip=True) if len(cols) >= 3 else ""
 
             members.append({
@@ -124,7 +118,7 @@ def parse_guild_members() -> list[dict]:
 
 
 async def fetch_members() -> list[dict]:
-    """Асинхронная обёртка над парсером."""
+    """Асинхронная обёртка — не блокирует event loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, parse_guild_members)
 
@@ -171,8 +165,8 @@ async def send_notify(text: str):
 # ══════════════════════════════════════════════════════════════
 
 async def check_guild_changes():
-    """Сравнивает текущий список участников с сохранённым в БД.
-    Шлёт уведомления при изменениях, обновляет снимок."""
+    """Сравнивает текущий список с сохранённым в БД.
+    Шлёт уведомления при входе/выходе участников."""
     try:
         current = await fetch_members()
         if not current:
@@ -255,6 +249,7 @@ async def cmd_botguild(message: Message):
 @router.message(Command("online"))
 async def cmd_online(message: Message):
     # Всегда свежие данные прямо с сайта
+    await message.answer("🔄 Проверяю сайт...")
     members = await fetch_members()
     online  = [m for m in members if m["is_online"]]
 
@@ -271,7 +266,7 @@ async def cmd_online(message: Message):
 
 @router.message(Command("lvl"))
 async def cmd_lvl(message: Message):
-    # Берём из БД (обновляется автоматически)
+    # Берём из БД — обновляется автоматически каждую минуту
     all_m = await members_col.find({}).to_list(length=None)
     if not all_m:
         await message.answer("⏳ Данные ещё загружаются, подожди минуту.")
@@ -287,51 +282,29 @@ async def cmd_lvl(message: Message):
 
 
 # ══════════════════════════════════════════════════════════════
-#  FLASK — вебхук + health check
+#  AIOHTTP — health check
 # ══════════════════════════════════════════════════════════════
 
-@flask_app.get("/")
-@flask_app.get("/health")
-def health():
-    return Response("OK", status=200)
-
-
-@flask_app.post(f"/{BOT_TOKEN}")
-def webhook():
-    """Принимает апдейты Telegram и передаёт их в aiogram."""
-    from aiogram.types import Update
-
-    data = flask_request.get_json(force=True, silent=True)
-    if not data:
-        return Response("Bad Request", status=400)
-
-    async def _process():
-        update = Update.model_validate(data)
-        await dp.feed_update(bot, update)
-
-    asyncio.run_coroutine_threadsafe(_process(), main_loop)
-    return Response("OK", status=200)
+async def health_check(request):
+    return web.Response(text="OK")
 
 
 # ══════════════════════════════════════════════════════════════
 #  ЗАПУСК
 # ══════════════════════════════════════════════════════════════
 
-async def bot_main():
-    global main_loop
-    main_loop = asyncio.get_running_loop()
+async def on_startup(app):
+    logger.info("Запуск бота...")
 
-    dp.include_router(router)
-
-    # Устанавливаем webhook
     if not WEBHOOK_URL:
         logger.error("WEBHOOK_URL не задан! Бот не будет получать сообщения от Telegram.")
-    else:
-        full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
-        await bot.set_webhook(full_url)
-        logger.info(f"Webhook установлен: {full_url}")
+        return
 
-    # Первоначальная загрузка участников если БД пустая
+    full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
+    await bot.set_webhook(full_url)
+    logger.info(f"Webhook установлен: {full_url}")
+
+    # Первоначальная загрузка если БД пустая
     count = await members_col.count_documents({})
     if count == 0:
         logger.info("БД пустая — загружаем первоначальный список...")
@@ -340,43 +313,47 @@ async def bot_main():
             await members_col.insert_many(members)
             logger.info(f"Загружено {len(members)} участников")
 
-    # Запускаем планировщик
+    # Планировщик автопроверки
     scheduler.add_job(
         check_guild_changes,
         "interval",
         minutes=CHECK_INTERVAL_MINUTES,
         id="guild_check",
-        max_instances=1,    # не запускать параллельно
+        max_instances=1,   # не запускать параллельно если предыдущий ещё идёт
     )
     scheduler.start()
     logger.info(f"Планировщик запущен — проверка каждые {CHECK_INTERVAL_MINUTES} мин.")
 
-    # Держим loop живым
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await bot.session.close()
+
+async def on_shutdown(app):
+    logger.info("Остановка...")
+    await bot.session.close()
+    if scheduler.running:
         scheduler.shutdown(wait=False)
 
 
-def run_bot():
-    """Запускает asyncio event loop с ботом в отдельном потоке."""
-    asyncio.run(bot_main())
-
-
 def main():
-    # Бот в фоновом потоке
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+    dp.include_router(router)
 
-    # Небольшая пауза чтобы loop успел стартануть до Flask
-    import time
-    time.sleep(2)
+    app = web.Application()
+    app.router.add_get("/",       health_check)
+    app.router.add_get("/health", health_check)
 
-    logger.info(f"Flask стартует на порту {PORT}")
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    # Регистрируем webhook-handler через aiogram
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=f"/{BOT_TOKEN}")
+    setup_application(app, dp, bot=bot)
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    logger.info(f"Сервер стартует на порту {PORT}")
+    web.run_app(app, host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен")
+    except Exception as e:
+        logger.critical(f"Критическая ошибка: {e}", exc_info=True)
