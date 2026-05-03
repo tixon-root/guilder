@@ -1,9 +1,8 @@
 import os
-import asyncio
 import logging
-import requests
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+import aiohttp
+from datetime import datetime
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
@@ -15,12 +14,10 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 
 load_dotenv()
-
-# ══════════════════════════════════════════════════════════════
-#  КОНФИГ
-# ══════════════════════════════════════════════════════════════
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,15 +25,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN   = os.getenv("BOT_TOKEN")
 MONGO_URI   = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 PORT        = int(os.getenv("PORT", 8080))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")   # https://yourapp.onrender.com  (без / в конце)
-OWNER_ID    = int(os.getenv("ADMIN_ID", "6395348885"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+OWNER_ID    = int(os.getenv("ADMIN_ID", "0"))
 GUILD_URL   = "https://www.rucoyonline.com/guild/Imperia%20Of%20Titans"
-
-CHECK_INTERVAL_MINUTES = 1   # как часто проверять сайт гильдии
-
-# ══════════════════════════════════════════════════════════════
-#  ИНИЦИАЛИЗАЦИЯ
-# ══════════════════════════════════════════════════════════════
 
 bot       = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp        = Dispatcher()
@@ -45,111 +36,100 @@ scheduler = AsyncIOScheduler()
 
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db           = mongo_client.rucoy_guild
-settings_col = db.settings
-members_col  = db.members
+config_col   = db["config"]
+members_col  = db["members"]
 
-# ══════════════════════════════════════════════════════════════
-#  ПАРСИНГ
-#
-#  Реальная структура таблицы на сайте:
-#    cols[0] = Name + роль/статус внутри текста
-#              "Hero Of Titan\nSupporter"
-#              "Shop Nomber One\n(Leader)"
-#              "NickName\nOnline"   ← когда игрок в сети
-#    cols[1] = Level (число)
-#    cols[2] = Join date ("Aug 12, 2025")
-# ══════════════════════════════════════════════════════════════
+# ==================== БД ====================
 
-def parse_guild_members() -> list[dict]:
-    """Синхронный парсинг — запускать через run_in_executor."""
-    try:
-        resp = requests.get(
-            GUILD_URL, timeout=15,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; GuildBot/1.0)"}
-        )
-        resp.encoding = "utf-8"
-        soup = BeautifulSoup(resp.content, "html.parser")
+async def get_config():
+    doc = await config_col.find_one({"_id": "main"})
+    return doc or {}
 
-        table = soup.find("table")
-        if not table:
-            logger.warning("Таблица участников не найдена на странице")
-            return []
-
-        members = []
-        for row in table.find_all("tr")[1:]:    # пропускаем заголовок
-            cols = row.find_all("td")
-            if len(cols) < 2:
-                continue
-
-            # Name + роль/статус
-            raw   = cols[0].get_text(separator="\n", strip=True)
-            lines = [l.strip() for l in raw.splitlines() if l.strip()]
-            name      = lines[0] if lines else ""
-            role_text = " ".join(lines[1:]).lower() if len(lines) > 1 else ""
-
-            if not name:
-                continue
-
-            is_leader = "leader" in role_text
-            is_online = "online" in role_text
-
-            # Level
-            level_str = cols[1].get_text(strip=True)
-            level     = int(level_str) if level_str.isdigit() else 0
-
-            # Join date
-            join_date = cols[2].get_text(strip=True) if len(cols) >= 3 else ""
-
-            members.append({
-                "name":      name,
-                "level":     level,
-                "join_date": join_date,
-                "role":      role_text,
-                "is_online": is_online,
-                "is_leader": is_leader,
-            })
-
-        logger.info(f"Спарсено {len(members)} участников")
-        return members
-
-    except Exception as e:
-        logger.error(f"parse_guild_members: {e}")
-        return []
-
-
-async def fetch_members() -> list[dict]:
-    """Асинхронная обёртка — не блокирует event loop."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, parse_guild_members)
-
-
-# ══════════════════════════════════════════════════════════════
-#  НАСТРОЙКИ УВЕДОМЛЕНИЙ
-# ══════════════════════════════════════════════════════════════
-
-async def get_notify_chat() -> tuple:
-    doc = await settings_col.find_one({"_id": "notify"})
-    if not doc:
-        return None, None
-    return doc.get("chat_id"), doc.get("topic_id")
-
-
-async def save_notify_chat(chat_id: int, topic_id, chat_title: str):
-    await settings_col.update_one(
-        {"_id": "notify"},
-        {"$set": {
-            "chat_id":    chat_id,
-            "topic_id":   topic_id,
-            "chat_title": chat_title,
-        }},
+async def set_config(chat_id: int, topic_id: Optional[int], chat_title: str):
+    await config_col.update_one(
+        {"_id": "main"},
+        {"$set": {"chat_id": chat_id, "topic_id": topic_id, "chat_title": chat_title}},
         upsert=True
     )
 
+async def get_saved_members():
+    doc = await members_col.find_one({"_id": "current"})
+    return doc.get("members", []) if doc else []
 
-async def send_notify(text: str):
-    chat_id, topic_id = await get_notify_chat()
+async def save_members(members: list):
+    await members_col.update_one(
+        {"_id": "current"},
+        {"$set": {"members": members, "updated_at": datetime.now()}},
+        upsert=True
+    )
+
+# ==================== ПАРСИНГ ====================
+
+async def parse_guild_members() -> list:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0"}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(GUILD_URL, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    logger.error(f"Сайт вернул {resp.status}")
+                    return []
+                html = await resp.text()
+
+        soup  = BeautifulSoup(html, "lxml")
+        table = soup.find("table")
+        if not table:
+            logger.warning("Таблица не найдена")
+            return []
+
+        members = []
+        for row in table.find_all("tr")[1:]:
+            cols = row.find_all("td")
+            if len(cols) < 2:
+                continue
+            try:
+                name_raw  = cols[0].get_text(separator=" ").strip()
+                is_leader = "Leader" in name_raw
+                is_online = "online" in name_raw.lower()
+
+                # Чистим имя
+                name = name_raw
+                for tag in ["(Leader)", "Leader", "Supporter", "Support",
+                            "Member", "online", "Online"]:
+                    name = name.replace(tag, "").strip()
+
+                level = 0
+                join_date = ""
+                try:
+                    level = int(cols[1].get_text(strip=True))
+                except Exception:
+                    pass
+                if len(cols) >= 3:
+                    join_date = cols[2].get_text(strip=True)
+
+                if name:
+                    members.append({
+                        "name":      name,
+                        "level":     level,
+                        "join_date": join_date,
+                        "is_leader": is_leader,
+                        "is_online": is_online,
+                    })
+            except Exception as e:
+                logger.warning(f"Ошибка строки: {e}")
+
+        return members
+    except Exception as e:
+        logger.error(f"Парсинг: {e}")
+        return []
+
+# ==================== УВЕДОМЛЕНИЯ ====================
+
+async def send_notification(text: str):
+    cfg = await get_config()
+    chat_id  = cfg.get("chat_id")
+    topic_id = cfg.get("topic_id")
     if not chat_id:
-        logger.warning("Чат уведомлений не настроен — используй /botguild")
+        logger.warning("Чат уведомлений не настроен")
         return
     try:
         kwargs = {"chat_id": chat_id, "text": text}
@@ -157,198 +137,182 @@ async def send_notify(text: str):
             kwargs["message_thread_id"] = topic_id
         await bot.send_message(**kwargs)
     except Exception as e:
-        logger.error(f"send_notify: {e}")
+        logger.error(f"Ошибка отправки: {e}")
 
-
-# ══════════════════════════════════════════════════════════════
-#  АВТОПРОВЕРКА ИЗМЕНЕНИЙ
-# ══════════════════════════════════════════════════════════════
+# ==================== ПРОВЕРКА ИЗМЕНЕНИЙ ====================
 
 async def check_guild_changes():
-    """Сравнивает текущий список с сохранённым в БД.
-    Шлёт уведомления при входе/выходе участников."""
     try:
-        current = await fetch_members()
+        current = await parse_guild_members()
         if not current:
             return
 
-        current_map = {m["name"]: m for m in current}
-        old_docs    = await members_col.find({}).to_list(length=None)
-        old_map     = {d["name"]: d for d in old_docs}
+        saved        = await get_saved_members()
+        current_names = {m["name"] for m in current}
+        saved_names   = {m["name"] for m in saved}
 
         # Новые участники
-        for name, m in current_map.items():
-            if name not in old_map:
-                role_tag = " 👑 <b>Лидер</b>" if m["is_leader"] else ""
-                await send_notify(
-                    f"🎉 <b>Новый участник!</b>{role_tag}\n\n"
-                    f"⚔️ Ник: <b>{m['name']}</b>\n"
-                    f"📈 Уровень: <b>{m['level']}</b>\n"
-                    f"📅 Вступил: {m['join_date']}\n\n"
-                    "Добро пожаловать в <b>Imperia Of Titans</b>! 🔥"
-                )
-                logger.info(f"Новый участник: {name}")
+        for name in current_names - saved_names:
+            m    = next(x for x in current if x["name"] == name)
+            role = " 👑 Лидер" if m["is_leader"] else ""
+            await send_notification(
+                f"🎉 <b>Новый участник!</b>{role}\n\n"
+                f"⚔️ Ник: <b>{m['name']}</b>\n"
+                f"📈 Уровень: <b>{m['level']}</b>\n"
+                f"📅 Вступил: {m['join_date']}\n\n"
+                f"Добро пожаловать в <b>Imperia Of Titans</b>! 🔥"
+            )
 
-        # Ушедшие участники
-        for name, d in old_map.items():
-            if name not in current_map:
-                role_tag = " (Лидер)" if d.get("is_leader") else ""
-                await send_notify(
-                    f"👋 <b>Участник покинул гильдию</b>{role_tag}\n\n"
-                    f"⚔️ Ник: <b>{d['name']}</b>\n"
-                    f"📈 Уровень: <b>{d['level']}</b>"
-                )
-                logger.info(f"Ушёл: {name}")
+        # Ушедшие
+        for name in saved_names - current_names:
+            m    = next(x for x in saved if x["name"] == name)
+            role = " (Лидер)" if m.get("is_leader") else ""
+            await send_notification(
+                f"👋 <b>Участник покинул гильдию</b>{role}\n\n"
+                f"⚔️ Ник: <b>{m['name']}</b>\n"
+                f"📈 Уровень: <b>{m['level']}</b>"
+            )
 
-        # Обновляем снимок в БД
-        await members_col.delete_many({})
-        await members_col.insert_many(current)
+        await save_members(current)
+        logger.info(f"Проверка: {len(current)} участников, "
+                    f"+{len(current_names - saved_names)} -{len(saved_names - current_names)}")
 
     except Exception as e:
         logger.error(f"check_guild_changes: {e}")
 
-
-# ══════════════════════════════════════════════════════════════
-#  КОМАНДЫ БОТА
-# ══════════════════════════════════════════════════════════════
+# ==================== КОМАНДЫ ====================
 
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
         "👋 Привет! Я бот гильдии <b>Imperia Of Titans</b> 🔥\n\n"
-        "<b>Команды для всех:</b>\n"
+        "Команды (доступны всем):\n"
         "/online — кто сейчас онлайн\n"
-        "/lvl — топ-5 по уровню\n\n"
-        "<b>Для владельца:</b>\n"
-        "/botguild — настроить эту тему/чат для уведомлений\n\n"
-        f"⏱ Данные обновляются автоматически каждые {CHECK_INTERVAL_MINUTES} мин."
+        "/lvl — топ-5 по уровню\n"
+        "/members — все участники\n\n"
+        "Для владельца:\n"
+        "/botguild — настроить этот чат для уведомлений\n"
+        "/update — обновить список участников"
     )
-
 
 @router.message(Command("botguild"))
 async def cmd_botguild(message: Message):
     if message.from_user.id != OWNER_ID:
-        await message.answer("❌ Эта команда только для владельца бота.")
         return
 
     chat_id    = message.chat.id
-    topic_id   = message.message_thread_id      # None если без тем
+    topic_id   = message.message_thread_id
     chat_title = message.chat.title or "Личные сообщения"
-    topic_info = f"\n🗂 Тема ID: <code>{topic_id}</code>" if topic_id else ""
+    topic_info = f" → тема <code>{topic_id}</code>" if topic_id else ""
 
-    await save_notify_chat(chat_id, topic_id, chat_title)
+    await set_config(chat_id, topic_id, chat_title)
     await message.answer(
-        f"✅ <b>Готово!</b>\n\n"
+        f"✅ <b>Настроено!</b>\n\n"
         f"📍 Чат: <b>{chat_title}</b>{topic_info}\n"
-        f"🆔 Chat ID: <code>{chat_id}</code>\n\n"
-        f"Уведомления о входе/выходе участников будут приходить сюда.\n"
-        f"⏱ Проверка каждые {CHECK_INTERVAL_MINUTES} мин."
+        f"ID: <code>{chat_id}</code>\n\n"
+        "Сюда будут приходить уведомления о новых и ушедших участниках."
     )
 
+@router.message(Command("update"))
+async def cmd_update(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    await message.answer("🔄 Загружаю данные с сайта гильдии...")
+    members = await parse_guild_members()
+    if not members:
+        await message.answer("❌ Не удалось получить данные. Проверь сайт гильдии.")
+        return
+    await save_members(members)
+    await message.answer(f"✅ Готово! Загружено участников: <b>{len(members)}</b>")
 
 @router.message(Command("online"))
 async def cmd_online(message: Message):
-    # Всегда свежие данные прямо с сайта
-    await message.answer("🔄 Проверяю сайт...")
-    members = await fetch_members()
-    online  = [m for m in members if m["is_online"]]
+    saved   = await get_saved_members()
+    online  = [m for m in saved if m.get("is_online")]
+    if not online:
+        # Пробуем получить свежие данные
+        fresh  = await parse_guild_members()
+        online = [m for m in fresh if m.get("is_online")]
 
     if not online:
-        await message.answer("⚪ Сейчас никого нет онлайн.")
+        await message.answer("🔴 Сейчас никого нет онлайн.")
         return
 
-    text = f"🟢 <b>Онлайн ({len(online)}):</b>\n\n"
+    text = "🟢 <b>Онлайн участники:</b>\n\n"
     for m in online:
-        icon  = "👑" if m["is_leader"] else "⚔️"
-        text += f"{icon} <b>{m['name']}</b> — ур. {m['level']}\n"
+        role  = "👑 " if m.get("is_leader") else "⚔️ "
+        text += f"{role}<b>{m['name']}</b> — ур. {m['level']}\n"
     await message.answer(text)
-
 
 @router.message(Command("lvl"))
 async def cmd_lvl(message: Message):
-    # Берём из БД — обновляется автоматически каждую минуту
-    all_m = await members_col.find({}).to_list(length=None)
-    if not all_m:
-        await message.answer("⏳ Данные ещё загружаются, подожди минуту.")
+    saved = await get_saved_members()
+    if not saved:
+        await message.answer("❌ Данные не загружены. Напиши /update")
         return
-
-    top5   = sorted(all_m, key=lambda x: x.get("level", 0), reverse=True)[:5]
+    top5   = sorted(saved, key=lambda x: x.get("level", 0), reverse=True)[:5]
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     text   = "🏆 <b>Топ-5 игроков гильдии:</b>\n\n"
     for i, m in enumerate(top5):
-        icon  = "👑 " if m.get("is_leader") else ""
-        text += f"{medals[i]} {icon}<b>{m['name']}</b> — ур. {m['level']}\n"
+        role  = "👑 " if m.get("is_leader") else ""
+        text += f"{medals[i]} {role}<b>{m['name']}</b> — ур. {m['level']}\n"
     await message.answer(text)
 
+@router.message(Command("members"))
+async def cmd_members(message: Message):
+    saved = await get_saved_members()
+    if not saved:
+        await message.answer("❌ Данные не загружены. Напиши /update")
+        return
+    sorted_m = sorted(saved, key=lambda x: x.get("level", 0), reverse=True)
+    text = f"👥 <b>Imperia Of Titans</b> ({len(sorted_m)} уч.):\n\n"
+    for m in sorted_m:
+        role   = "👑 " if m.get("is_leader") else ""
+        online = "🟢" if m.get("is_online") else "⚪"
+        text  += f"{online} {role}<b>{m['name']}</b> — ур. {m['level']}\n"
+    if len(text) > 4000:
+        text = text[:3900] + "\n\n...и другие"
+    await message.answer(text)
 
-# ══════════════════════════════════════════════════════════════
-#  AIOHTTP — health check
-# ══════════════════════════════════════════════════════════════
+# ==================== ЗАПУСК ====================
 
 async def health_check(request):
     return web.Response(text="OK")
 
-
-# ══════════════════════════════════════════════════════════════
-#  ЗАПУСК
-# ══════════════════════════════════════════════════════════════
-
 async def on_startup(app):
     logger.info("Запуск бота...")
+    if WEBHOOK_URL:
+        url = f"{WEBHOOK_URL}/{BOT_TOKEN}"
+        await bot.set_webhook(url)
+        logger.info(f"Webhook: {url}")
+    else:
+        logger.warning("WEBHOOK_URL не задан!")
 
-    if not WEBHOOK_URL:
-        logger.error("WEBHOOK_URL не задан! Бот не будет получать сообщения от Telegram.")
-        return
-
-    full_url = f"{WEBHOOK_URL.rstrip('/')}/{BOT_TOKEN}"
-    await bot.set_webhook(full_url)
-    logger.info(f"Webhook установлен: {full_url}")
-
-    # Первоначальная загрузка если БД пустая
-    count = await members_col.count_documents({})
-    if count == 0:
-        logger.info("БД пустая — загружаем первоначальный список...")
-        members = await fetch_members()
-        if members:
-            await members_col.insert_many(members)
-            logger.info(f"Загружено {len(members)} участников")
-
-    # Планировщик автопроверки
-    scheduler.add_job(
-        check_guild_changes,
-        "interval",
-        minutes=CHECK_INTERVAL_MINUTES,
-        id="guild_check",
-        max_instances=1,   # не запускать параллельно если предыдущий ещё идёт
-    )
-    scheduler.start()
-    logger.info(f"Планировщик запущен — проверка каждые {CHECK_INTERVAL_MINUTES} мин.")
-
+    if not scheduler.running:
+        scheduler.add_job(check_guild_changes, "interval", minutes=5)
+        scheduler.start()
+        logger.info("Планировщик запущен — проверка каждые 5 мин")
 
 async def on_shutdown(app):
-    logger.info("Остановка...")
     await bot.session.close()
     if scheduler.running:
-        scheduler.shutdown(wait=False)
-
+        scheduler.shutdown()
 
 def main():
     dp.include_router(router)
 
     app = web.Application()
-    app.router.add_get("/",       health_check)
+    app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
 
-    # Регистрируем webhook-handler через aiogram
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=f"/{BOT_TOKEN}")
     setup_application(app, dp, bot=bot)
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
-    logger.info(f"Сервер стартует на порту {PORT}")
+    logger.info(f"Сервер на порту {PORT}")
     web.run_app(app, host="0.0.0.0", port=PORT)
-
 
 if __name__ == "__main__":
     try:
@@ -356,4 +320,4 @@ if __name__ == "__main__":
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен")
     except Exception as e:
-        logger.critical(f"Критическая ошибка: {e}", exc_info=True)
+        logger.error(f"Критическая ошибка: {e}")
